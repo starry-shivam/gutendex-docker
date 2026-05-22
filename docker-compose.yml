@@ -3,16 +3,17 @@ services:
     image: postgres:16
     restart: unless-stopped
     environment:
-      POSTGRES_DB: ${DATABASE_NAME:-gutendex}
-      POSTGRES_USER: ${DATABASE_USER:-gutendex}
-      POSTGRES_PASSWORD: ${DATABASE_PASSWORD:-gutendex}
+      POSTGRES_DB: gutendex
+      POSTGRES_USER: gutendex
+      POSTGRES_PASSWORD: change-me-please
     volumes:
-      - postgres_data:/var/lib/postgresql/data
+      - ./data/postgres:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${DATABASE_USER:-gutendex} -d ${DATABASE_NAME:-gutendex}"]
+      test: ["CMD-SHELL", "pg_isready -U gutendex -d gutendex"]
       interval: 10s
       timeout: 5s
       retries: 10
+    user: 1000:1000  
 
   web:
     build:
@@ -22,35 +23,9 @@ services:
       db:
         condition: service_healthy
     ports:
-      - ${WEB_PORT:-8000}:8000
-    environment:
-      ADMIN_EMAILS: ${ADMIN_EMAILS:-}
-      ADMIN_NAMES: ${ADMIN_NAMES:-}
-      ALLOWED_HOSTS: ${ALLOWED_HOSTS:-127.0.0.1,localhost}
-      DATABASE_HOST: ${DATABASE_HOST:-db}
-      DATABASE_NAME: ${DATABASE_NAME:-gutendex}
-      DATABASE_PASSWORD: ${DATABASE_PASSWORD:-gutendex}
-      DATABASE_PORT: ${DATABASE_PORT:-5432}
-      DATABASE_USER: ${DATABASE_USER:-gutendex}
-      DEBUG: ${DEBUG:-true}
-      EMAIL_HOST: ${EMAIL_HOST:-}
-      EMAIL_HOST_ADDRESS: ${EMAIL_HOST_ADDRESS:-}
-      EMAIL_HOST_PASSWORD: ${EMAIL_HOST_PASSWORD:-}
-      EMAIL_HOST_USER: ${EMAIL_HOST_USER:-}
-      MANAGER_EMAILS: ${MANAGER_EMAILS:-}
-      MANAGER_NAMES: ${MANAGER_NAMES:-}
-      MEDIA_ROOT: ${MEDIA_ROOT:-/app/mediafiles}
-      SECRET_KEY: ${SECRET_KEY:-django-insecure-dev-only-change-me}
-      STATIC_ROOT: ${STATIC_ROOT:-/app/staticfiles}
-      RUN_UPDATECATALOG_ON_STARTUP: ${RUN_UPDATECATALOG_ON_STARTUP:-false}
-      DB_WAIT_TIMEOUT: ${DB_WAIT_TIMEOUT:-120}
+      - 5073:8000
     volumes:
-      - static_data:/app/staticfiles
-      - media_data:/app/mediafiles
-      - catalog_data:/app/catalog_files
-
-volumes:
-  postgres_data:
-  static_data:
-  media_data:
-  catalog_data:
+      - ./data/staticfiles:/app/staticfiles
+      - ./data/mediafiles:/app/mediafiles
+      - ./data/catalog_files:/app/catalog_files
+    user: 1000:1000  
