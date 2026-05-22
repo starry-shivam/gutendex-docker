@@ -34,7 +34,7 @@ def get_book(id, xml_file_path):
     document = None
     try:
         document = parser.parse(xml_file_path)
-    except:
+    except (parser.ParseError, OSError):
         raise Exception('The XML file could not be parsed.')
 
     # Get the book node.

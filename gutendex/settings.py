@@ -14,20 +14,32 @@ import environ
 import os
 
 
+# Build paths inside the project like this: os.path.join(BASE_DIR, ...)
+BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
 # Import environment variables
 env = environ.Env(
     ADMIN_EMAILS=(list, []),
     ADMIN_NAMES=(list, []),
-    ALLOWED_HOSTS=(list, []),
+    ALLOWED_HOSTS=(list, ['127.0.0.1', 'localhost']),
+    DATABASE_HOST=(str, 'db'),
+    DATABASE_NAME=(str, 'gutendex'),
+    DATABASE_PASSWORD=(str, 'gutendex'),
+    DATABASE_PORT=(str, '5432'),
+    DATABASE_USER=(str, 'gutendex'),
     DEBUG=(bool, False),
+    EMAIL_HOST=(str, ''),
+    EMAIL_HOST_ADDRESS=(str, ''),
+    EMAIL_HOST_PASSWORD=(str, ''),
+    EMAIL_HOST_USER=(str, ''),
     MANAGER_EMAILS=(list, []),
     MANAGER_NAMES=(list, []),
+    MEDIA_ROOT=(str, os.path.join(BASE_DIR, 'mediafiles')),
+    SECRET_KEY=(str, 'django-insecure-dev-only-change-me'),
+    STATIC_ROOT=(str, os.path.join(BASE_DIR, 'staticfiles')),
 )
 environ.Env.read_env()
-
-
-# Build paths inside the project like this: os.path.join(BASE_DIR, ...)
-BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
 # Quick-start development settings - unsuitable for production

@@ -1,6 +1,6 @@
 from rest_framework import serializers
 
-from .models import *
+from .models import Book, Bookshelf, Format, Language, Person, Subject, Summary
 
 
 class BookshelfSerializer(serializers.ModelSerializer):
