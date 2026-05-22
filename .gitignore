@@ -3,4 +3,5 @@
 .vscode
 catalog_files
 gutendex/.env
+.env
 venv

@@ -6,4 +6,5 @@ djangorestframework==3.15.2
 inflection==0.5.1
 psycopg2-binary==2.9.10
 six==1.16.0
+requests==2.34.2
 sqlparse>=0.5.0 # not directly required, pinned by Snyk to avoid a vulnerability

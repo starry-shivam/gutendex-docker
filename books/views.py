@@ -1,9 +1,9 @@
 from django.db.models import Q
 
-from rest_framework import exceptions as drf_exceptions, viewsets
+from rest_framework import viewsets
 
-from .models import *
-from .serializers import *
+from .models import Book
+from .serializers import BookSerializer
 
 
 class BookViewSet(viewsets.ModelViewSet):
@@ -30,7 +30,7 @@ class BookViewSet(viewsets.ModelViewSet):
         author_year_end = self.request.GET.get('author_year_end')
         try:
             author_year_end = int(author_year_end)
-        except:
+        except (TypeError, ValueError):
             author_year_end = None
         if author_year_end is not None:
             queryset = queryset.filter(
@@ -41,7 +41,7 @@ class BookViewSet(viewsets.ModelViewSet):
         author_year_start = self.request.GET.get('author_year_start')
         try:
             author_year_start = int(author_year_start)
-        except:
+        except (TypeError, ValueError):
             author_year_start = None
         if author_year_start is not None:
             queryset = queryset.filter(
