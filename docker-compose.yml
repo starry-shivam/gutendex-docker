@@ -1,35 +1,11 @@
 services:
-  db:
-    image: postgres:16
-    restart: unless-stopped
-    environment:
-      POSTGRES_DB: gutendex
-      POSTGRES_USER: gutendex
-      POSTGRES_PASSWORD: "change-me-please"
-    volumes:
-      - ./data/postgres:/var/lib/postgresql/data
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U gutendex -d gutendex"]
-      interval: 10s
-      timeout: 5s
-      retries: 10
-
-  web:
+  gutendex-next:
+    container_name: gutendex-next
     build:
       context: .
     restart: unless-stopped
-    depends_on:
-      db:
-        condition: service_healthy
     ports:
       - 5073:8000
-    environment:
-      # Must be same as POSTGRES_PASSWORD in db service
-      DATABASE_PASSWORD: "change-me-please"
-      # Add your domain here
-      ALLOWED_HOSTS: 127.0.0.1,localhost,my.domain.com
     volumes:
-      - ./data/staticfiles:/app/staticfiles
-      - ./data/mediafiles:/app/mediafiles
-      - ./data/catalog_files:/app/catalog_files
+      - ./data:/app/data  # Database and catalog data
     user: 1000:1000

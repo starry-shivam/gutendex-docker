@@ -1,9 +1,15 @@
 .git
 .gitignore
+.dockerignore
 __pycache__
+**/__pycache__
 *.pyc
 *.pyo
 *.pyd
 venv
-catalog_files
-gutendex/.env
+.env
+*.md
+data/
+catalog/temp
+catalog/rdf
+catalog/logs
