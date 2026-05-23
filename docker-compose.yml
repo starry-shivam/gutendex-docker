@@ -5,7 +5,7 @@ services:
     environment:
       POSTGRES_DB: gutendex
       POSTGRES_USER: gutendex
-      POSTGRES_PASSWORD: change-me-please
+      POSTGRES_PASSWORD: "change-me-please"
     volumes:
       - ./data/postgres:/var/lib/postgresql/data
     healthcheck:
@@ -13,7 +13,6 @@ services:
       interval: 10s
       timeout: 5s
       retries: 10
-    user: 1000:1000  
 
   web:
     build:
@@ -24,8 +23,11 @@ services:
         condition: service_healthy
     ports:
       - 5073:8000
+    environment:
+      # Must be same as POSTGRES_PASSWORD in db service
+      DATABASE_PASSWORD: "change-me-please"
     volumes:
       - ./data/staticfiles:/app/staticfiles
       - ./data/mediafiles:/app/mediafiles
       - ./data/catalog_files:/app/catalog_files
-    user: 1000:1000  
+    user: 1000:1000
