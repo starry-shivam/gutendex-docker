@@ -26,6 +26,8 @@ services:
     environment:
       # Must be same as POSTGRES_PASSWORD in db service
       DATABASE_PASSWORD: "change-me-please"
+      # Add your domain here
+      ALLOWED_HOSTS: 127.0.0.1,localhost,my.domain.com
     volumes:
       - ./data/staticfiles:/app/staticfiles
       - ./data/mediafiles:/app/mediafiles
