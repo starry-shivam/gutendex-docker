@@ -1,11 +1,11 @@
 Gutendex Next
 =============
 
-A rewrite of the [Gutendex](https://github.com/garethbjohnson/gutendex) API in **FastAPI + SQLite**, built for lower resource usage and faster response times.
+A FastAPI & SQLite rewrite of the Django & Postgres-based [Gutendex](https://github.com/garethbjohnson/gutendex) API, optimized for lower resource usage, faster response times, and simple Docker Compose deployment.
 
-Self-hosted [web API](https://en.wikipedia.org/wiki/Web_API) for serving book catalog data from
-[Project Gutenberg](https://www.gutenberg.org/wiki/Main_Page). Gutendex Next is a **100% drop-in
-replacement** — same endpoints, query parameters, and response format, so existing clients require
+Gutendex-Next is a self-hosted [web API](https://en.wikipedia.org/wiki/Web_API) for serving book catalog data from
+[Project Gutenberg](https://www.gutenberg.org/wiki/Main_Page). It is a *drop-in
+replacement* for original Gutendex API featuring same endpoints, query parameters, and response format, so existing clients require
 no changes.
 
 
@@ -25,7 +25,7 @@ mkdir -p data
 # 3. Build and start
 docker compose up -d
 
-# 4. Import the Gutenberg catalog (one-time, takes 20-30 min)
+# 4. Import the Gutenberg catalog (one-time, takes 30-45 min)
 docker compose exec gutendex-next python catalog/updatecatalog.py
 
 # 5. Test it
