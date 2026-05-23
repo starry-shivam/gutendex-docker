@@ -16,11 +16,11 @@ Quick Start
 
 ```bash
 # 1. Clone and enter the project
-git clone <repo-url>
+git clone https://github.com/starry-shivam/gutendex-next.git
 cd gutendex-docker
 
 # 2. Create data directories
-mkdir -p data catalog
+mkdir -p data
 
 # 3. Build and start
 docker compose up -d
