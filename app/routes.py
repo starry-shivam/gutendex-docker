@@ -8,7 +8,7 @@ from fastapi.responses import RedirectResponse
 
 from app.database import get_db
 from app.models import Book, Person, Bookshelf, Language, Subject, Format
-from app.schemas import BookSchema, BookListResponse
+from app.schemas import BookListResponse
 
 router = APIRouter(prefix="/books", tags=["books"])
 
@@ -52,7 +52,11 @@ def serialize_book(book: Book) -> dict:
     bookshelves = sorted([b.name for b in book.bookshelves if b and b.name is not None])
     
     # Get languages sorted
-    languages = sorted([l.code for l in book.languages if l and l.code is not None])
+    languages = sorted([
+        language.code
+        for language in book.languages
+        if language and language.code is not None
+    ])
     
     # Get subjects sorted
     subjects = sorted([s.name for s in book.subjects if s and s.name is not None])
@@ -126,9 +130,9 @@ def list_books(
         # Build filter: keep only books whose copyright is in copyright_values
         copyright_conditions = []
         if True in copyright_values:
-            copyright_conditions.append(Book.copyright == True)
+            copyright_conditions.append(Book.copyright.is_(True))
         if False in copyright_values:
-            copyright_conditions.append(Book.copyright == False)
+            copyright_conditions.append(Book.copyright.is_(False))
         if None in copyright_values:
             copyright_conditions.append(Book.copyright.is_(None))
         

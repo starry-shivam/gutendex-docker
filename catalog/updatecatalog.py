@@ -4,121 +4,246 @@ Gutendex catalog update script.
 Downloads and processes Project Gutenberg catalog data.
 """
 
+import logging
 import os
-import sys
-import json
-import re
 import shutil
+import sqlite3
+import sys
 import tarfile
 import time
-from pathlib import Path
+from contextlib import contextmanager
+from dataclasses import dataclass
 from datetime import datetime
-from typing import Set, Dict, Optional, List
-from subprocess import run
+from pathlib import Path
+from typing import Dict, List, Optional, Set, Tuple
 
 import requests
 from requests.adapters import HTTPAdapter
-from sqlalchemy import create_engine
-from sqlalchemy.orm import sessionmaker
+from sqlalchemy import create_engine, event
+from sqlalchemy.orm import Session, sessionmaker
 
 # Add parent directory to path for app imports
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from app.models import (
-    Base, Book, Person, Bookshelf, Language, Subject, Summary, Format
+    Base,
+    Book,
+    Bookshelf,
+    Format,
+    Language,
+    Person,
+    Subject,
+    Summary,
 )
 from catalog.utils import get_book
 
+
+# =============================================================================
 # Configuration
-TEMP_PATH = os.getenv("CATALOG_TEMP_DIR", "/app/data/catalog/temp")
-CATALOG_RDF_DIR = os.getenv("CATALOG_RDF_DIR", "/app/data/catalog/rdf")
-LOG_DIRECTORY = os.getenv("CATALOG_LOG_DIR", "/app/data/catalog/logs")
-DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:////app/data/gutendex.db")
+# =============================================================================
 
-URL = 'https://gutenberg.org/cache/epub/feeds/rdf-files.tar.bz2'
-DOWNLOAD_PATH = os.path.join(TEMP_PATH, 'catalog.tar.bz2')
-DOWNLOAD_CHUNK_SIZE = 4 * 1024 * 1024
-DOWNLOAD_TIMEOUT_SECONDS = 60
-DOWNLOAD_MAX_ATTEMPTS = 3
 
-MOVE_SOURCE_PATH = os.path.join(TEMP_PATH, 'cache/epub')
-MOVE_TARGET_PATH = CATALOG_RDF_DIR
+@dataclass(frozen=True)
+class Config:
+    temp_path: Path = Path(
+        os.getenv("CATALOG_TEMP_DIR", "/app/data/catalog/temp")
+    )
+    rdf_dir: Path = Path(
+        os.getenv("CATALOG_RDF_DIR", "/app/data/catalog/rdf")
+    )
+    log_dir: Path = Path(
+        os.getenv("CATALOG_LOG_DIR", "/app/data/catalog/logs")
+    )
+    database_url: str = os.getenv(
+        "DATABASE_URL",
+        "sqlite:////app/data/gutendex.db",
+    )
 
-# Database setup
-engine = create_engine(DATABASE_URL)
-Base.metadata.create_all(bind=engine)
-SessionLocal = sessionmaker(bind=engine)
+    download_url: str = (
+        "https://gutenberg.org/cache/epub/feeds/rdf-files.tar.bz2"
+    )
 
+    download_chunk_size: int = 4 * 1024 * 1024
+    download_timeout_seconds: int = 60
+    download_max_attempts: int = 3
+
+    db_batch_size: int = 1000
+    progress_interval_seconds: int = 5
+
+
+CONFIG = Config()
+
+DOWNLOAD_PATH = CONFIG.temp_path / "catalog.tar.bz2"
+MOVE_SOURCE_PATH = CONFIG.temp_path / "cache" / "epub"
+MOVE_TARGET_PATH = CONFIG.rdf_dir
+
+
+# =============================================================================
 # Logging
-LOG_FILE_NAME = datetime.now().strftime('%Y-%m-%d_%H%M%S') + '.txt'
-LOG_PATH = os.path.join(LOG_DIRECTORY, LOG_FILE_NAME)
+# =============================================================================
 
 
-def log(*args):
-    """Print and log messages."""
-    message = ' '.join(str(arg) for arg in args)
-    print(message, flush=True)
-    if not os.path.exists(LOG_DIRECTORY):
-        os.makedirs(LOG_DIRECTORY)
-    with open(LOG_PATH, 'a') as log_file:
-        log_file.write(message + '\n')
+CONFIG.log_dir.mkdir(parents=True, exist_ok=True)
+
+LOG_FILE_NAME = datetime.now().strftime("%Y-%m-%d_%H%M%S") + ".txt"
+LOG_PATH = CONFIG.log_dir / LOG_FILE_NAME
+
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[
+        logging.FileHandler(LOG_PATH),
+        logging.StreamHandler(sys.stdout),
+    ],
+)
+
+logger = logging.getLogger("gutendex_catalog")
+
+
+# =============================================================================
+# Database setup
+# =============================================================================
+
+
+engine = create_engine(
+    CONFIG.database_url,
+    future=True,
+)
+
+
+@event.listens_for(engine, "connect")
+def configure_sqlite(dbapi_connection, connection_record):
+    """Apply SQLite performance pragmas safely."""
+
+    if isinstance(dbapi_connection, sqlite3.Connection):
+        cursor = dbapi_connection.cursor()
+
+        cursor.execute("PRAGMA journal_mode=WAL")
+        cursor.execute("PRAGMA synchronous=NORMAL")
+        cursor.execute("PRAGMA temp_store=MEMORY")
+        cursor.execute("PRAGMA cache_size=-200000")
+        cursor.execute("PRAGMA foreign_keys=ON")
+
+        cursor.close()
+
+
+Base.metadata.create_all(bind=engine)
+
+SessionLocal = sessionmaker(
+    bind=engine,
+    autoflush=False,
+    expire_on_commit=False,
+)
+
+
+# =============================================================================
+# Utility functions
+# =============================================================================
+
+
+LOCK_FILE_PATH = CONFIG.temp_path.parent / ".catalog_update.lock"
+
+
+@contextmanager
+def file_lock():
+    """Prevent concurrent executions."""
+
+    if LOCK_FILE_PATH.exists():
+        raise RuntimeError(
+            f"Another catalog update process is already running: {LOCK_FILE_PATH}"
+        )
+
+    LOCK_FILE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    LOCK_FILE_PATH.write_text(str(os.getpid()))
+
+    try:
+        yield
+    finally:
+        try:
+            LOCK_FILE_PATH.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+
+@contextmanager
+def temporary_directory(path: Path):
+    """Safely recreate temporary directory."""
+
+    if path.exists():
+        shutil.rmtree(path)
+
+    path.mkdir(parents=True, exist_ok=True)
+
+    try:
+        yield path
+    finally:
+        if path.exists():
+            shutil.rmtree(path, ignore_errors=True)
 
 
 def format_file_size(size_in_bytes: int) -> str:
-    """Convert bytes to human readable format."""
-    units = ['B', 'KB', 'MB', 'GB', 'TB']
+    units = ["B", "KB", "MB", "GB", "TB"]
+
     size = float(max(size_in_bytes, 0))
+
     for unit in units:
         if size < 1024 or unit == units[-1]:
-            if unit == 'B':
-                return f'{int(size)} {unit}'
-            return f'{size:.2f} {unit}'
+            if unit == "B":
+                return f"{int(size)} {unit}"
+            return f"{size:.2f} {unit}"
         size /= 1024
 
 
-def get_directory_set(path: str) -> Set[str]:
-    """Get set of subdirectory names in a path."""
-    directory_set = set()
-    if not os.path.exists(path):
-        return directory_set
-    for directory_item in os.listdir(path):
-        item_path = os.path.join(path, directory_item)
-        if os.path.isdir(item_path):
-            directory_set.add(directory_item)
-    return directory_set
+def get_directory_set(path: Path) -> Set[str]:
+    if not path.exists():
+        return set()
 
-
-def download_file_with_progress(url: str, destination_path: str) -> Dict:
-    """Download file with progress reporting and resume capability."""
-    started_at = time.monotonic()
-    session = requests.Session()
-    adapter = HTTPAdapter(
-        pool_connections=10,
-        pool_maxsize=10,
-        max_retries=0,
-    )
-    session.mount("http://", adapter)
-    session.mount("https://", adapter)
-
-    browser_headers = {
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/124.0 Safari/537.36"
-        ),
-        "Accept": "*/*",
-        "Accept-Encoding": "identity",
-        "Connection": "keep-alive",
+    return {
+        item.name
+        for item in path.iterdir()
+        if item.is_dir()
     }
 
-    for attempt in range(1, DOWNLOAD_MAX_ATTEMPTS + 1):
-        downloaded = (
-            os.path.getsize(destination_path)
-            if os.path.exists(destination_path)
-            else 0
-        )
 
-        headers = dict(browser_headers)
+# =============================================================================
+# Download logic
+# =============================================================================
+
+
+SESSION = requests.Session()
+
+adapter = HTTPAdapter(
+    pool_connections=10,
+    pool_maxsize=10,
+    max_retries=0,
+)
+
+SESSION.mount("http://", adapter)
+SESSION.mount("https://", adapter)
+
+
+HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/124.0 Safari/537.36"
+    ),
+    "Accept": "*/*",
+    "Accept-Encoding": "identity",
+    "Connection": "keep-alive",
+}
+
+
+def download_file_with_progress(url: str, destination_path: Path) -> Dict:
+    """Download file with progress reporting and resume support."""
+
+    started_at = time.monotonic()
+
+    for attempt in range(1, CONFIG.download_max_attempts + 1):
+        downloaded = destination_path.stat().st_size if destination_path.exists() else 0
+
+        headers = dict(HEADERS)
 
         if downloaded > 0:
             headers["Range"] = f"bytes={downloaded}-"
@@ -127,13 +252,17 @@ def download_file_with_progress(url: str, destination_path: str) -> Dict:
             mode = "wb"
 
         try:
-            log(f"Download attempt {attempt}/{DOWNLOAD_MAX_ATTEMPTS}")
+            logger.info(
+                "Download attempt %s/%s",
+                attempt,
+                CONFIG.download_max_attempts,
+            )
 
-            with session.get(
+            with SESSION.get(
                 url,
                 headers=headers,
                 stream=True,
-                timeout=(10, DOWNLOAD_TIMEOUT_SECONDS),
+                timeout=(10, CONFIG.download_timeout_seconds),
                 allow_redirects=True,
             ) as response:
 
@@ -149,21 +278,18 @@ def download_file_with_progress(url: str, destination_path: str) -> Dict:
                 elif content_length:
                     total_size = downloaded + int(content_length)
 
-                if total_size:
-                    log(f"Expected size: {format_file_size(total_size)}")
-                else:
-                    log("Expected size: unknown")
+                logger.info(
+                    "Expected size: %s",
+                    format_file_size(total_size) if total_size else "unknown",
+                )
 
                 last_report = time.monotonic()
                 last_downloaded = downloaded
 
-                with open(
-                    destination_path,
-                    mode,
-                    buffering=8 * 1024 * 1024,
-                ) as f:
-
-                    for chunk in response.iter_content(chunk_size=DOWNLOAD_CHUNK_SIZE):
+                with open(destination_path, mode, buffering=8 * 1024 * 1024) as f:
+                    for chunk in response.iter_content(
+                        chunk_size=CONFIG.download_chunk_size
+                    ):
                         if not chunk:
                             continue
 
@@ -173,21 +299,27 @@ def download_file_with_progress(url: str, destination_path: str) -> Dict:
                         now = time.monotonic()
 
                         if now - last_report >= 2:
-                            instant_elapsed = now - last_report
-                            speed = (downloaded - last_downloaded) / max(instant_elapsed, 1e-6)
+                            instant_elapsed = max(now - last_report, 1e-6)
+
+                            speed = (
+                                downloaded - last_downloaded
+                            ) / instant_elapsed
 
                             if total_size:
                                 percent = downloaded * 100 / total_size
-                                log(
-                                    f"{percent:6.2f}% | "
-                                    f"{format_file_size(downloaded)} / "
-                                    f"{format_file_size(total_size)} | "
-                                    f"{format_file_size(speed)}/s"
+
+                                logger.info(
+                                    "%.2f%% | %s / %s | %s/s",
+                                    percent,
+                                    format_file_size(downloaded),
+                                    format_file_size(total_size),
+                                    format_file_size(speed),
                                 )
                             else:
-                                log(
-                                    f"{format_file_size(downloaded)} | "
-                                    f"{format_file_size(speed)}/s"
+                                logger.info(
+                                    "%s | %s/s",
+                                    format_file_size(downloaded),
+                                    format_file_size(speed),
                                 )
 
                             last_report = now
@@ -203,393 +335,543 @@ def download_file_with_progress(url: str, destination_path: str) -> Dict:
                     "seconds": time.monotonic() - started_at,
                 }
 
-        except Exception as e:
-            log(f"Attempt {attempt} failed: {e}")
-            if attempt >= DOWNLOAD_MAX_ATTEMPTS:
+        except Exception:
+            logger.exception("Download attempt failed")
+
+            if attempt >= CONFIG.download_max_attempts:
                 raise
-            log("Retrying...")
+
+            logger.info("Retrying download...")
             time.sleep(2)
 
     raise RuntimeError("Download failed")
 
 
-def get_changed_book_ids(rsync_output_lines: List[str]) -> Set[int]:
-    """Extract book IDs from rsync output."""
-    book_ids = set()
-    for line in rsync_output_lines:
-        match = re.match(r'^(\d+)/', line.strip())
-        if match:
-            book_ids.add(int(match.group(1)))
-    return book_ids
+# =============================================================================
+# Cache preload
+# =============================================================================
+
+
+class EntityCache:
+    def __init__(self, db: Session):
+        self.people: Dict[Tuple[str, int, int], Person] = {
+            (p.name, p.birth_year, p.death_year): p
+            for p in db.query(Person).all()
+        }
+
+        self.bookshelves: Dict[str, Bookshelf] = {
+            b.name: b
+            for b in db.query(Bookshelf).all()
+        }
+
+        self.languages: Dict[str, Language] = {
+            language.code: language
+            for language in db.query(Language).all()
+        }
+
+        self.subjects: Dict[str, Subject] = {
+            s.name: s
+            for s in db.query(Subject).all()
+        }
+
+
+# =============================================================================
+# Entity helpers
+# =============================================================================
 
 
 def get_or_create_person(
-    db,
+    db: Session,
+    cache: EntityCache,
     data: Dict,
-    cache: Optional[Dict] = None
 ) -> Person:
-    """Get or create a Person in the database."""
-    person_key = (data['name'], data['birth'], data['death'])
+    key = (data["name"], data["birth"], data["death"])
 
-    if cache is not None and person_key in cache:
-        return cache[person_key]
+    person = cache.people.get(key)
 
-    person = db.query(Person).filter(
-        Person.name == data['name'],
-        Person.birth_year == data['birth'],
-        Person.death_year == data['death']
-    ).first()
+    if person is not None:
+        return person
 
-    if person is None:
-        person = Person(
-            name=data['name'],
-            birth_year=data['birth'],
-            death_year=data['death']
-        )
-        db.add(person)
-        db.flush()
+    person = Person(
+        name=data["name"],
+        birth_year=data["birth"],
+        death_year=data["death"],
+    )
 
-    if cache is not None:
-        cache[person_key] = person
+    db.add(person)
+    db.flush()
+
+    cache.people[key] = person
 
     return person
 
 
-def get_or_create_bookshelf(db, name: str, cache: Dict) -> Bookshelf:
-    """Get or create a Bookshelf in the database."""
-    if name in cache:
-        return cache[name]
+def get_or_create_bookshelf(
+    db: Session,
+    cache: EntityCache,
+    name: str,
+) -> Bookshelf:
+    shelf = cache.bookshelves.get(name)
 
-    bookshelf = db.query(Bookshelf).filter(Bookshelf.name == name).first()
-    if bookshelf is None:
-        bookshelf = Bookshelf(name=name)
-        db.add(bookshelf)
-        db.flush()
+    if shelf is not None:
+        return shelf
 
-    cache[name] = bookshelf
-    return bookshelf
+    shelf = Bookshelf(name=name)
+
+    db.add(shelf)
+    db.flush()
+
+    cache.bookshelves[name] = shelf
+
+    return shelf
 
 
-def get_or_create_language(db, code: str, cache: Dict) -> Language:
-    """Get or create a Language in the database."""
-    if code in cache:
-        return cache[code]
+def get_or_create_language(
+    db: Session,
+    cache: EntityCache,
+    code: str,
+) -> Language:
+    language = cache.languages.get(code)
 
-    language = db.query(Language).filter(Language.code == code).first()
-    if language is None:
-        language = Language(code=code)
-        db.add(language)
-        db.flush()
+    if language is not None:
+        return language
 
-    cache[code] = language
+    language = Language(code=code)
+
+    db.add(language)
+    db.flush()
+
+    cache.languages[code] = language
+
     return language
 
 
-def get_or_create_subject(db, name: str, cache: Dict) -> Subject:
-    """Get or create a Subject in the database."""
-    if name in cache:
-        return cache[name]
+def get_or_create_subject(
+    db: Session,
+    cache: EntityCache,
+    name: str,
+) -> Subject:
+    subject = cache.subjects.get(name)
 
-    subject = db.query(Subject).filter(Subject.name == name).first()
-    if subject is None:
-        subject = Subject(name=name)
-        db.add(subject)
-        db.flush()
+    if subject is not None:
+        return subject
 
-    cache[name] = subject
+    subject = Subject(name=name)
+
+    db.add(subject)
+    db.flush()
+
+    cache.subjects[name] = subject
+
     return subject
 
 
-def put_catalog_in_db(db, book_ids: Optional[List[int]] = None) -> Dict:
+# =============================================================================
+# Import logic
+# =============================================================================
+
+
+def put_catalog_in_db(
+    db: Session,
+    book_ids: Optional[List[int]] = None,
+) -> Dict:
     """Import catalog data into the database."""
+
     if book_ids is None:
         book_ids = []
-        for directory_item in os.listdir(CATALOG_RDF_DIR):
-            item_path = os.path.join(CATALOG_RDF_DIR, directory_item)
-            if os.path.isdir(item_path):
-                try:
-                    book_id = int(directory_item)
-                    book_ids.append(book_id)
-                except ValueError:
-                    pass
-    else:
-        # Keep only valid numeric IDs that still exist on disk.
-        validated_book_ids = []
-        for id in book_ids:
-            try:
-                normalized_id = int(id)
-            except (TypeError, ValueError):
-                log(f'Skipping invalid catalog directory name: {id}')
-                continue
 
-            if os.path.isdir(os.path.join(CATALOG_RDF_DIR, str(normalized_id))):
-                validated_book_ids.append(normalized_id)
-
-        book_ids = validated_book_ids
+        for item in CONFIG.rdf_dir.iterdir():
+            if item.is_dir() and item.name.isdigit():
+                book_ids.append(int(item.name))
 
     book_ids.sort()
+
     total_books = len(book_ids)
-    progress_step = max(1, total_books // 20) if total_books else 1
 
     stats = {
-        'processed': 0,
-        'created': 0,
-        'updated': 0,
-        'total': total_books,
+        "processed": 0,
+        "created": 0,
+        "updated": 0,
+        "total": total_books,
     }
+
     started_at = time.monotonic()
     last_progress_at = started_at
-    last_progress_index = 0
 
-    person_cache = {}
-    bookshelf_cache = {}
-    language_cache = {}
-    subject_cache = {}
+    logger.info("Preloading entity caches...")
 
-    if total_books:
-        log(f'Import queue size: {total_books} books')
+    cache = EntityCache(db)
+
+    logger.info("Import queue size: %s books", total_books)
 
     for index, book_id in enumerate(book_ids, start=1):
-        if index == 1 or index % progress_step == 0 or index == total_books:
-            progress = int(index * 100 / total_books)
-            now = time.monotonic()
+        now = time.monotonic()
+
+        if now - last_progress_at >= CONFIG.progress_interval_seconds:
             elapsed = max(now - started_at, 1e-9)
-            overall_rate = index / elapsed
+            rate = index / elapsed
 
-            if last_progress_index > 0:
-                recent_elapsed = max(now - last_progress_at, 1e-9)
-                recent_rate = (index - last_progress_index) / recent_elapsed
-                rate_text = (
-                    f'overall {overall_rate:.1f} books/s; '
-                    f'recent {recent_rate:.1f} books/s'
-                )
-            else:
-                rate_text = f'overall {overall_rate:.1f} books/s; recent warming up'
+            logger.info(
+                "DB import progress: %s/%s (%.2f%%) %.1f books/s",
+                index,
+                total_books,
+                (index * 100 / total_books) if total_books else 0,
+                rate,
+            )
 
-            log(f'DB import progress: {index}/{total_books} ({progress}%) {rate_text}')
             last_progress_at = now
-            last_progress_index = index
 
-        book_path = os.path.join(
-            CATALOG_RDF_DIR,
-            str(book_id),
-            f'pg{book_id}.rdf'
-        )
+        book_path = CONFIG.rdf_dir / str(book_id) / f"pg{book_id}.rdf"
 
         try:
-            book_data = get_book(book_id, book_path)
+            book_data = get_book(book_id, str(book_path))
 
-            # Make/update the book
-            book_in_db = db.query(Book).filter(Book.gutenberg_id == book_id).first()
+            book_in_db = (
+                db.query(Book)
+                .filter(Book.gutenberg_id == book_id)
+                .first()
+            )
 
-            if book_in_db is not None:
-                book_in_db.copyright = book_data['copyright']
-                book_in_db.download_count = book_data['downloads']
-                book_in_db.media_type = book_data['type']
-                book_in_db.title = book_data['title']
-                stats['updated'] += 1
-            else:
+            if book_in_db is None:
                 book_in_db = Book(
                     gutenberg_id=book_id,
-                    copyright=book_data['copyright'],
-                    download_count=book_data['downloads'],
-                    media_type=book_data['type'],
-                    title=book_data['title']
+                    copyright=book_data["copyright"],
+                    download_count=book_data["downloads"],
+                    media_type=book_data["type"],
+                    title=book_data["title"],
                 )
+
                 db.add(book_in_db)
                 db.flush()
-                stats['created'] += 1
 
-            # Make/update authors
-            authors = []
-            for author in book_data['authors']:
-                person = get_or_create_person(db, author, person_cache)
-                authors.append(person)
-            book_in_db.authors = authors
+                stats["created"] += 1
 
-            # Make/update editors
-            editors = []
-            for editor in book_data['editors']:
-                person = get_or_create_person(db, editor, person_cache)
-                editors.append(person)
-            book_in_db.editors = editors
+            else:
+                book_in_db.copyright = book_data["copyright"]
+                book_in_db.download_count = book_data["downloads"]
+                book_in_db.media_type = book_data["type"]
+                book_in_db.title = book_data["title"]
 
-            # Make/update translators
-            translators = []
-            for translator in book_data['translators']:
-                person = get_or_create_person(db, translator, person_cache)
-                translators.append(person)
-            book_in_db.translators = translators
+                stats["updated"] += 1
 
-            # Make/update bookshelves
-            bookshelves = []
-            for shelf in book_data['bookshelves']:
-                shelf_in_db = get_or_create_bookshelf(db, shelf, bookshelf_cache)
-                bookshelves.append(shelf_in_db)
-            book_in_db.bookshelves = bookshelves
+            # Authors
+            book_in_db.authors = [
+                get_or_create_person(db, cache, author)
+                for author in book_data["authors"]
+            ]
 
-            # Make/update formats
+            # Editors
+            book_in_db.editors = [
+                get_or_create_person(db, cache, editor)
+                for editor in book_data["editors"]
+            ]
+
+            # Translators
+            book_in_db.translators = [
+                get_or_create_person(db, cache, translator)
+                for translator in book_data["translators"]
+            ]
+
+            # Bookshelves
+            book_in_db.bookshelves = [
+                get_or_create_bookshelf(db, cache, shelf)
+                for shelf in book_data["bookshelves"]
+            ]
+
+            # Languages
+            book_in_db.languages = [
+                get_or_create_language(db, cache, lang)
+                for lang in book_data["languages"]
+            ]
+
+            # Subjects
+            book_in_db.subjects = [
+                get_or_create_subject(db, cache, subject)
+                for subject in book_data["subjects"]
+            ]
+
+            # Formats
             existing_formats = {
                 (f.mime_type, f.url): f
-                for f in db.query(Format).filter(Format.book_id == book_in_db.id)
+                for f in db.query(Format)
+                .filter(Format.book_id == book_in_db.id)
             }
-            expected_formats = set(book_data['formats'].items())
 
-            missing_formats = expected_formats - set(existing_formats.keys())
-            for mime_type, url in missing_formats:
-                format_obj = Format(book_id=book_in_db.id, mime_type=mime_type, url=url)
-                db.add(format_obj)
+            expected_formats = set(book_data["formats"].items())
+
+            new_format_rows = [
+                {
+                    "book_id": book_in_db.id,
+                    "mime_type": mime_type,
+                    "url": url,
+                }
+                for mime_type, url in expected_formats
+                if (mime_type, url) not in existing_formats
+            ]
+
+            if new_format_rows:
+                db.bulk_insert_mappings(
+                    Format,
+                    new_format_rows,
+                )
 
             stale_format_ids = [
-                f.id for (mime_type, url), f in existing_formats.items()
-                if (mime_type, url) not in expected_formats
+                obj.id
+                for key, obj in existing_formats.items()
+                if key not in expected_formats
             ]
+
             if stale_format_ids:
-                db.query(Format).filter(Format.id.in_(stale_format_ids)).delete()
+                db.query(Format).filter(
+                    Format.id.in_(stale_format_ids)
+                ).delete(synchronize_session=False)
 
-            # Make/update languages
-            languages = []
-            for language in book_data['languages']:
-                language_in_db = get_or_create_language(db, language, language_cache)
-                languages.append(language_in_db)
-            book_in_db.languages = languages
-
-            # Make/update subjects
-            subjects = []
-            for subject in book_data['subjects']:
-                subject_in_db = get_or_create_subject(db, subject, subject_cache)
-                subjects.append(subject_in_db)
-            book_in_db.subjects = subjects
-
-            # Make/update summaries
+            # Summaries
             existing_summaries = {
                 s.text: s
-                for s in db.query(Summary).filter(Summary.book_id == book_in_db.id)
+                for s in db.query(Summary)
+                .filter(Summary.book_id == book_in_db.id)
             }
-            expected_summaries = set(book_data['summaries'])
 
-            missing_summaries = expected_summaries - set(existing_summaries.keys())
-            for summary_text in missing_summaries:
-                summary_obj = Summary(book_id=book_in_db.id, text=summary_text)
-                db.add(summary_obj)
+            expected_summaries = set(book_data["summaries"])
+
+            new_summary_rows = [
+                {
+                    "book_id": book_in_db.id,
+                    "text": summary_text,
+                }
+                for summary_text in expected_summaries
+                if summary_text not in existing_summaries
+            ]
+
+            if new_summary_rows:
+                db.bulk_insert_mappings(
+                    Summary,
+                    new_summary_rows,
+                )
 
             stale_summary_ids = [
-                s.id for text, s in existing_summaries.items()
+                obj.id
+                for text, obj in existing_summaries.items()
                 if text not in expected_summaries
             ]
+
             if stale_summary_ids:
-                db.query(Summary).filter(Summary.id.in_(stale_summary_ids)).delete()
+                db.query(Summary).filter(
+                    Summary.id.in_(stale_summary_ids)
+                ).delete(synchronize_session=False)
 
-            db.commit()
-            stats['processed'] += 1
+            stats["processed"] += 1
 
-        except Exception as error:
-            log(f'Error while putting book {book_id} in the database:')
-            log(str(error))
+            # Batch commit for huge speedups
+            if index % CONFIG.db_batch_size == 0:
+                db.commit()
+                db.expire_all()
+
+                logger.info(
+                    "Committed batch at %s books",
+                    index,
+                )
+
+        except Exception:
+            logger.exception(
+                "Error while importing book %s",
+                book_id,
+            )
+
             db.rollback()
-            raise error
+            raise
+
+    db.commit()
 
     duration = time.monotonic() - started_at
-    stats['duration_seconds'] = duration
+
+    stats["duration_seconds"] = duration
+
     return stats
 
 
+# =============================================================================
+# Archive extraction
+# =============================================================================
+
+
+SAFE_TAR_TYPES = {
+    tarfile.REGTYPE,
+    tarfile.AREGTYPE,
+    tarfile.DIRTYPE,
+}
+
+
+def safe_extract_tar(archive_path: Path, destination: Path):
+    """Safely extract tar archive."""
+
+    with tarfile.open(archive_path, "r:bz2") as tar:
+        for member in tar.getmembers():
+            if member.type not in SAFE_TAR_TYPES:
+                raise RuntimeError(
+                    f"Unsafe tar member detected: {member.name}"
+                )
+
+            target_path = destination / member.name
+
+            if not str(target_path.resolve()).startswith(
+                str(destination.resolve())
+            ):
+                raise RuntimeError(
+                    f"Unsafe extraction path detected: {member.name}"
+                )
+
+        tar.extractall(destination, filter="data")
+
+
+# =============================================================================
+# Main
+# =============================================================================
+
+
 def main():
-    """Main catalog update function."""
-    try:
-        db = SessionLocal()
-        script_started_at = time.monotonic()
-        date_and_time = datetime.now().strftime('%H:%M:%S on %B %d, %Y')
-        log(f'Starting script at {date_and_time}')
+    script_started_at = time.monotonic()
 
-        log('Making temporary directory...')
-        if os.path.exists(TEMP_PATH):
-            log('Temporary path already exists; removing stale directory...')
-            shutil.rmtree(TEMP_PATH)
-        os.makedirs(TEMP_PATH)
-        log(f'Temporary directory ready at {TEMP_PATH}')
+    logger.info(
+        "Starting script at %s",
+        datetime.now().strftime("%H:%M:%S on %B %d, %Y"),
+    )
 
-        log('Downloading compressed catalog...')
-        log(f'Source URL: {URL}')
-        download_stats = download_file_with_progress(URL, DOWNLOAD_PATH)
-        log(
-            f'Download complete: {format_file_size(download_stats["downloaded"])} '
-            f'in {download_stats["seconds"]:.1f}s'
-        )
+    with file_lock():
+        with temporary_directory(CONFIG.temp_path):
+            db = SessionLocal()
 
-        log('Decompressing catalog...')
-        if not os.path.exists(DOWNLOAD_PATH):
-            raise RuntimeError(f'Downloaded catalog archive not found at {DOWNLOAD_PATH}')
-        
-        decompress_started_at = time.monotonic()
-        try:
-            with tarfile.open(DOWNLOAD_PATH, 'r:bz2') as tar_archive:
-                tar_archive.extractall(path=TEMP_PATH, filter='data')
-        except (tarfile.TarError, OSError) as error:
-            raise RuntimeError(f'Failed to decompress catalog: {str(error)}')
-        
-        log(f'Decompression complete in {time.monotonic() - decompress_started_at:.1f}s')
+            try:
+                # Download
+                logger.info("Downloading compressed catalog...")
+                logger.info("Source URL: %s", CONFIG.download_url)
 
-        log('Detecting stale directories...')
-        if not os.path.exists(MOVE_TARGET_PATH):
-            os.makedirs(MOVE_TARGET_PATH)
-        
-        new_directory_set = get_directory_set(MOVE_SOURCE_PATH)
-        old_directory_set = get_directory_set(MOVE_TARGET_PATH)
-        stale_directory_set = old_directory_set - new_directory_set
-        
-        log(f'New directories found: {len(new_directory_set)}')
-        log(f'Existing directories found: {len(old_directory_set)}')
-        log(f'Stale directories detected: {len(stale_directory_set)}')
+                download_stats = download_file_with_progress(
+                    CONFIG.download_url,
+                    DOWNLOAD_PATH,
+                )
 
-        log('Moving new catalog data...')
-        for directory_item in os.listdir(MOVE_SOURCE_PATH):
-            source = os.path.join(MOVE_SOURCE_PATH, directory_item)
-            target = os.path.join(MOVE_TARGET_PATH, directory_item)
-            if os.path.isdir(source):
-                if os.path.exists(target):
-                    shutil.rmtree(target)
-                shutil.copytree(source, target)
+                logger.info(
+                    "Download complete: %s in %.1fs",
+                    format_file_size(download_stats["downloaded"]),
+                    download_stats["seconds"],
+                )
 
-        log('Removing stale directories...')
-        for directory_item in stale_directory_set:
-            stale_path = os.path.join(MOVE_TARGET_PATH, directory_item)
-            if os.path.exists(stale_path):
-                shutil.rmtree(stale_path)
+                # Extract
+                logger.info("Decompressing catalog...")
 
-        log('Removing temporary directory...')
-        shutil.rmtree(TEMP_PATH)
+                extract_started = time.monotonic()
 
-        log('Putting catalog in database...')
-        changed_book_ids = [int(directory_name) for directory_name in new_directory_set if directory_name.isdigit()]
+                safe_extract_tar(
+                    DOWNLOAD_PATH,
+                    CONFIG.temp_path,
+                )
 
-        skipped_non_book_directories = [
-            directory_name for directory_name in new_directory_set
-            if not directory_name.isdigit()
-        ]
-        if skipped_non_book_directories:
-            log(
-                'Skipping non-book directories during DB import: '
-                + ', '.join(sorted(skipped_non_book_directories))
-            )
+                logger.info(
+                    "Decompression complete in %.1fs",
+                    time.monotonic() - extract_started,
+                )
 
-        stats = put_catalog_in_db(db, changed_book_ids)
+                # Detect stale directories
+                logger.info("Detecting stale directories...")
 
-        log(f'Database import complete:')
-        log(f'  Processed: {stats["processed"]} books')
-        log(f'  Created: {stats["created"]} books')
-        log(f'  Updated: {stats["updated"]} books')
-        log(f'  Duration: {stats["duration_seconds"]:.1f}s')
+                MOVE_TARGET_PATH.mkdir(parents=True, exist_ok=True)
 
-        elapsed = time.monotonic() - script_started_at
-        log(f'Script complete in {elapsed:.1f}s')
+                new_directory_set = get_directory_set(MOVE_SOURCE_PATH)
+                old_directory_set = get_directory_set(MOVE_TARGET_PATH)
 
-        db.close()
+                stale_directory_set = old_directory_set - new_directory_set
 
-    except Exception as e:
-        log(f'Fatal error: {str(e)}')
-        raise
+                logger.info(
+                    "New directories found: %s",
+                    len(new_directory_set),
+                )
+
+                logger.info(
+                    "Existing directories found: %s",
+                    len(old_directory_set),
+                )
+
+                logger.info(
+                    "Stale directories detected: %s",
+                    len(stale_directory_set),
+                )
+
+                # Atomic replacement moves
+                logger.info("Moving new catalog data...")
+
+                for source_dir in MOVE_SOURCE_PATH.iterdir():
+                    if not source_dir.is_dir():
+                        continue
+
+                    target_dir = MOVE_TARGET_PATH / source_dir.name
+                    temp_target = target_dir.with_suffix(".tmp")
+
+                    if temp_target.exists():
+                        shutil.rmtree(temp_target)
+
+                    shutil.move(str(source_dir), str(temp_target))
+
+                    if target_dir.exists():
+                        shutil.rmtree(target_dir)
+
+                    os.replace(temp_target, target_dir)
+
+                # Remove stale dirs
+                logger.info("Removing stale directories...")
+
+                for stale_name in stale_directory_set:
+                    stale_path = MOVE_TARGET_PATH / stale_name
+
+                    if stale_path.exists():
+                        shutil.rmtree(stale_path)
+
+                # Import into DB
+                logger.info("Putting catalog in database...")
+
+                changed_book_ids = sorted(
+                    int(name)
+                    for name in new_directory_set
+                    if name.isdigit()
+                )
+
+                skipped_non_book_directories = sorted(
+                    name
+                    for name in new_directory_set
+                    if not name.isdigit()
+                )
+
+                if skipped_non_book_directories:
+                    logger.info(
+                        "Skipping non-book directories during DB import: %s",
+                        ", ".join(skipped_non_book_directories),
+                    )
+
+                stats = put_catalog_in_db(
+                    db,
+                    changed_book_ids,
+                )
+
+                logger.info("Database import complete:")
+                logger.info("  Processed: %s books", stats["processed"])
+                logger.info("  Created: %s books", stats["created"])
+                logger.info("  Updated: %s books", stats["updated"])
+                logger.info(
+                    "  Duration: %.1fs",
+                    stats["duration_seconds"],
+                )
+
+                elapsed = time.monotonic() - script_started_at
+
+                logger.info(
+                    "Script complete in %.1fs",
+                    elapsed,
+                )
+
+            finally:
+                db.close()
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
