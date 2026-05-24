@@ -11,4 +11,5 @@ data
 *.db
 *.db-wal
 *.db-shm
+.ruff_cache
 
