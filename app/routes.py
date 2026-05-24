@@ -4,7 +4,6 @@ from urllib.parse import urlencode
 from sqlalchemy import or_
 from sqlalchemy.orm import Session, selectinload
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
-from fastapi.responses import RedirectResponse
 
 from app.database import get_db
 from app.models import Book, Person, Bookshelf, Language, Subject, Format
@@ -25,12 +24,6 @@ BOOK_LOAD_OPTIONS = (
 )
 
 
-def redirect_to_canonical(path: str, request: Request) -> RedirectResponse:
-    query = request.url.query
-    url = path if not query else f"{path}?{query}"
-    return RedirectResponse(url=url, status_code=301)
-
-
 def build_page_url(request: Request, page: int) -> str:
     query_items = [item for item in request.query_params.multi_items() if item[0] != "page"]
     if all(key != "page_size" for key, _ in query_items):
@@ -38,7 +31,7 @@ def build_page_url(request: Request, page: int) -> str:
 
     query = urlencode([("page", str(page)), *query_items], doseq=True)
     base_url = str(request.base_url).rstrip("/")
-    return f"{base_url}{request.url.path}?{query}"
+    return f"{base_url}/books?{query}"
 
 
 def serialize_book(book: Book) -> dict:
@@ -84,11 +77,7 @@ def serialize_book(book: Book) -> dict:
     }
 
 
-@router.get("", include_in_schema=False)
-def redirect_books(request: Request):
-    return redirect_to_canonical("/books/", request)
-
-
+@router.get("", include_in_schema=False, response_model=BookListResponse, response_model_by_alias=False)
 @router.get("/", response_model=BookListResponse, response_model_by_alias=False)
 def list_books(
     request: Request,
