@@ -313,11 +313,19 @@ def put_catalog_in_db(db, book_ids: Optional[List[int]] = None) -> Dict:
                 except ValueError:
                     pass
     else:
-        # Keep only IDs that still exist
-        book_ids = [
-            id for id in book_ids
-            if os.path.isdir(os.path.join(CATALOG_RDF_DIR, str(id)))
-        ]
+        # Keep only valid numeric IDs that still exist on disk.
+        validated_book_ids = []
+        for id in book_ids:
+            try:
+                normalized_id = int(id)
+            except (TypeError, ValueError):
+                log(f'Skipping invalid catalog directory name: {id}')
+                continue
+
+            if os.path.isdir(os.path.join(CATALOG_RDF_DIR, str(normalized_id))):
+                validated_book_ids.append(normalized_id)
+
+        book_ids = validated_book_ids
 
     book_ids.sort()
     total_books = len(book_ids)
@@ -553,7 +561,18 @@ def main():
         shutil.rmtree(TEMP_PATH)
 
         log('Putting catalog in database...')
-        changed_book_ids = list(new_directory_set)
+        changed_book_ids = [int(directory_name) for directory_name in new_directory_set if directory_name.isdigit()]
+
+        skipped_non_book_directories = [
+            directory_name for directory_name in new_directory_set
+            if not directory_name.isdigit()
+        ]
+        if skipped_non_book_directories:
+            log(
+                'Skipping non-book directories during DB import: '
+                + ', '.join(sorted(skipped_non_book_directories))
+            )
+
         stats = put_catalog_in_db(db, changed_book_ids)
 
         log(f'Database import complete:')
