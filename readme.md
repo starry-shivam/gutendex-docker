@@ -16,8 +16,8 @@ Quick Start
 
 ```bash
 # 1. Clone and enter the project
-git clone https://github.com/starry-shivam/gutendex-next.git
-cd gutendex-docker
+git clone https://github.com/Pool-Of-Tears/gutendex-next.git
+cd gutendex-next
 
 # 2. Create data directories
 mkdir -p data
